@@ -1,10 +1,24 @@
 from pydantic import BaseModel
+import os
 
 class ModelConfig(BaseModel):
     config: str = "configs/stable-diffusion/v1-inference.yaml"
-    checkpoint: str = "models/ldm/stable-diffusion-v1/model.ckpt"
+    checkpoint: str = "weights/sd-v1-4.ckpt"
     plms: bool = False
     laion400m: bool = False
+
+    @pydantic.validator("config"):
+    @classmethod
+    def config_validator(self, value):
+        if not os.path.exists(value):
+            raise FileNotFoundError("Try using full path for model config")
+        return value
+
+    @pydantic.validator("checkpoint"):
+    @classmethod
+    def config_validator(self, value):
+        if not os.path.exists(value):
+            raise FileNotFoundError("Try using full path for model config")
 
 class TextPromptConfig(BaseModel):
     prompt: str
