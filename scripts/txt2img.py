@@ -9,7 +9,7 @@ from imwatermark import WatermarkEncoder
 from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
-import time
+from datetime import datetime
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import contextmanager, nullcontext
@@ -20,12 +20,23 @@ from ldm.models.diffusion.plms import PLMSSampler
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from os import devnull
+
+@contextmanager
+def suppress_stdout_stderr():
+    with open(devnull, 'w') as fnull:
+        with redirect_stderr(fnull) as err, redirect_stdout(fnull) as out:
+            yield (err, out)
 
 
 # load safety model
-safety_model_id = "CompVis/stable-diffusion-safety-checker"
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+def load_safety_model():
+    safety_model_id = "CompVis/stable-diffusion-safety-checker"
+    global safety_feature_extractor
+    global safety_checker
+    safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+    safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
 
 def chunk(it, size):
@@ -100,7 +111,7 @@ def main():
     parser.add_argument(
         "--prompt",
         type=str,
-        nargs="?",
+        nargs="*",
         default="a painting of a virus monster playing guitar",
         help="the prompt to render"
     )
@@ -109,12 +120,12 @@ def main():
         type=str,
         nargs="?",
         help="dir to write results to",
-        default="outputs/txt2img-samples"
+        default="latest_creations"
     )
     parser.add_argument(
-        "--skip_grid",
+        "--make_grid",
         action='store_true',
-        help="do not save a grid, only individual samples. Helpful when evaluating lots of samples",
+        help="save a grid. Helpful when evaluating lots of samples",
     )
     parser.add_argument(
         "--skip_save",
@@ -151,7 +162,7 @@ def main():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=2,
+        default=1,
         help="sample this often",
     )
     parser.add_argument(
@@ -210,13 +221,13 @@ def main():
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="models/ldm/stable-diffusion-v1/model.ckpt",
+        default="weights/sd-v1-4.ckpt",
         help="path to checkpoint of model",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=None,
         help="the seed (for reproducible sampling)",
     )
     parser.add_argument(
@@ -226,6 +237,23 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--watermark",
+        default=False,
+        action="store_true",
+        help="Add invisible watermark to image"
+    )
+    parser.add_argument(
+        "--nsfw-filter",
+        default=False,
+        action="store_true",
+        help="Filter out NSFW images"
+    )
+    parser.add_argument(
+        "--max-per-batch",
+        default=1,
+        type=int,
+        help="Number of images to generate in a single batch (to avoid OOM error on Gpu)")
     opt = parser.parse_args()
 
     if opt.laion400m:
@@ -234,7 +262,8 @@ def main():
         opt.ckpt = "models/ldm/text2img-large/model.ckpt"
         opt.outdir = "outputs/txt2img-samples-laion400m"
 
-    seed_everything(opt.seed)
+    if opt.seed is not None:
+        seed_everything(opt.seed)
 
     config = OmegaConf.load(f"{opt.config}")
     model = load_model_from_config(config, f"{opt.ckpt}")
@@ -250,24 +279,17 @@ def main():
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
 
-    print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-    wm = "StableDiffusionV1"
-    wm_encoder = WatermarkEncoder()
-    wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+    if opt.watermark:
+        print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
+        wm = "StableDiffusionV1"
+        wm_encoder = WatermarkEncoder()
+        wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
-    batch_size = opt.n_samples
-    n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
+    if opt.nsfw_filter:
+        load_safety_model()
 
-    else:
-        print(f"reading prompts from {opt.from_file}")
-        with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = list(chunk(data, batch_size))
-
+    if opt.make_grid:
+        n_rows = opt.n_rows if opt.n_rows > 0 else opt.n_samples
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
     base_count = len(os.listdir(sample_path))
@@ -278,63 +300,95 @@ def main():
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
-    with torch.no_grad():
-        with precision_scope("cuda"):
-            with model.ema_scope():
-                tic = time.time()
-                all_samples = list()
-                for n in trange(opt.n_iter, desc="Sampling"):
-                    for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
-                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                         conditioning=c,
-                                                         batch_size=opt.n_samples,
-                                                         shape=shape,
-                                                         verbose=False,
-                                                         unconditional_guidance_scale=opt.scale,
-                                                         unconditional_conditioning=uc,
-                                                         eta=opt.ddim_eta,
-                                                         x_T=start_code)
 
-                        x_samples_ddim = model.decode_first_stage(samples_ddim)
-                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+    """
+    if not opt.from_file:
+        prompt = opt.prompt
+        assert prompt is not None
+        data = [batch_size * [prompt]]
+    else:
+        print(f"reading prompts from {opt.from_file}")
+        with open(opt.from_file, "r") as f:
+            data = f.read().splitlines()
+            data = list(chunk(data, batch_size))
+    """
+    for prompt in opt.prompt:
+        start_time = datetime.now()
+        if opt.n_samples % opt.max_per_batch == 0:
+            num_passes = opt.n_samples // opt.max_per_batch
+        else:
+            num_passes = opt.n_samples // opt.max_per_batch + 1
+        assert prompt is not None
+        all_samples = list()
+        print(f"Beginning image generation for prompt: {prompt}")
+        to_gen_remaining = opt.n_samples
+        for _ in trange(num_passes):
+            batch_size = min(to_gen_remaining, opt.max_per_batch)
+            data = [batch_size * [prompt]]
+            with torch.no_grad():
+                with precision_scope("cuda"):
+                    with model.ema_scope():
+                        for n in range(opt.n_iter):
+                            for prompts in data:
+                                uc = None
+                                if opt.scale != 1.0:
+                                    uc = model.get_learned_conditioning(batch_size * [""])
+                                if isinstance(prompts, tuple):
+                                    prompts = list(prompts)
+                                c = model.get_learned_conditioning(prompts)
+                                shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                                with suppress_stdout_stderr():
+                                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                                     conditioning=c,
+                                                                     batch_size=batch_size,
+                                                                     shape=shape,
+                                                                     verbose=False,
+                                                                     unconditional_guidance_scale=opt.scale,
+                                                                     unconditional_conditioning=uc,
+                                                                     eta=opt.ddim_eta,
+                                                                     x_T=start_code)
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                                x_samples_ddim = model.decode_first_stage(samples_ddim)
+                                x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                                x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+                                if opt.nsfw_filter:
+                                    x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                                else:
+                                    x_checked_image = x_samples_ddim
 
-                        if not opt.skip_save:
-                            for x_sample in x_checked_image_torch:
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                img = put_watermark(img, wm_encoder)
-                                img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                                base_count += 1
+                                x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
-                        if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
+                                if not opt.skip_save:
+                                    for x_sample in x_checked_image_torch:
+                                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                                        img = Image.fromarray(x_sample.astype(np.uint8))
+                                        if opt.watermark:
+                                            img = put_watermark(img, wm_encoder)
+                                        img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                                        base_count += 1
 
-                if not opt.skip_grid:
-                    # additionally, save as grid
-                    grid = torch.stack(all_samples, 0)
-                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                    grid = make_grid(grid, nrow=n_rows)
+                                if opt.make_grid:
+                                    all_samples.append(x_checked_image_torch.cpu())
+            to_gen_remaining -= batch_size
 
-                    # to image
-                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    img = Image.fromarray(grid.astype(np.uint8))
-                    img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                    grid_count += 1
+        if opt.make_grid:
+            # additionally, save as grid
+            grid = torch.stack(all_samples, 0)
+            grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+            grid = make_grid(grid, nrow=n_rows)
 
-                toc = time.time()
+            # to image
+            grid = 255. * rearrange(grid, 'c h w -> h w c').numpy()
+            img = Image.fromarray(grid.astype(np.uint8))
+            if opt.watermark:
+                img = put_watermark(img, wm_encoder)
+            img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+            grid_count += 1
+
+        stop_time = datetime.now()
+        print(f'Generated {opt.n_samples} pictures of {prompt} in {stop_time-start_time}')
+
 
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")
